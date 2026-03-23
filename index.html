@@ -1546,6 +1546,10 @@
 ══════════════════════════════════════════ -->
 <div id="welcome-screen" class="screen active">
   <div class="welcome-bg-lines"></div>
+  <!-- Sync indicator: shown briefly while Firebase loads a returning user's session -->
+  <div id="sync-status" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:rgba(200,16,46,0.92);color:#fff;text-align:center;font-size:13px;font-weight:600;letter-spacing:0.5px;padding:10px;">
+    ⟳ Syncing your account…
+  </div>
   <div class="welcome-content">
     <div class="absa-badge">
       <div class="absa-badge-dot"></div>
@@ -2754,63 +2758,95 @@ if (FB_LIVE) {
 function fbKey(username) { return btoa(username.toLowerCase()).replace(/[.#$/\[\]]/g,'_'); }
 
 // Write one user record to Firebase (non-blocking)
+// Write user to Firebase (non-blocking — called on every progress save)
 function fbPushUser(user) {
   if (!fbDb) return;
-  const safe = Object.assign({}, user);
-  fbDb.ref('lms_users/' + fbKey(user.username)).set(safe).catch(() => {});
+  fbDb.ref('lms_users/' + fbKey(user.username)).set(Object.assign({}, user)).catch(() => {});
 }
 
-// Merge Firebase users into localStorage (called on page load)
-function fbSyncToLocal() {
-  if (!fbDb) return;
-  fbDb.ref('lms_users').once('value').then(snap => {
-    if (!snap.exists()) return;
-    const local    = getUsers();
-    const localMap = {};
-    local.forEach(u => { localMap[u.username.toLowerCase()] = true; });
-    let changed = false;
-    snap.forEach(child => {
-      const u = child.val();
-      if (u && u.username && !localMap[u.username.toLowerCase()]) {
-        local.push(u);
-        localMap[u.username.toLowerCase()] = true;
-        changed = true;
-      }
-    });
-    if (changed) { saveUsers(local); console.log('[LMS] Synced accounts from Firebase'); }
-  }).catch(() => {});
+// Fetch a single user from Firebase and merge into localStorage, then call cb(mergedUser)
+// Firebase is the source of truth for progress — local cache is secondary
+function fbFetchAndMerge(username, cb) {
+  if (!fbDb) { cb(null); return; }
+  fbDb.ref('lms_users/' + fbKey(username)).once('value').then(snap => {
+    if (!snap.exists()) { cb(null); return; }
+    const fbUser = snap.val();
+    if (!fbUser || !fbUser.username) { cb(null); return; }
+    // Update localStorage with the authoritative Firebase record
+    const local = getUsers();
+    const idx   = local.findIndex(u => (u.username||'').toLowerCase() === username.toLowerCase());
+    if (idx !== -1) {
+      local[idx] = Object.assign({}, local[idx], fbUser);
+      saveUsers(local);
+      cb(local[idx]);
+    } else {
+      local.push(fbUser);
+      saveUsers(local);
+      cb(fbUser);
+    }
+  }).catch(() => cb(null));
 }
 
-// Attempt Firebase login if user not found in localStorage
+// Login via Firebase when account not in localStorage (first login on this device)
 function fbLoginFallback(username, password) {
   if (!fbDb) {
-    showLoginError('signin-error','No account found. Check your username or create a new account.');
+    showLoginError('signin-error', 'No account found. Check your username or create a new account.');
     return;
   }
-  fbDb.ref('lms_users/' + fbKey(username)).once('value').then(snap => {
-    if (!snap.exists()) {
-      showLoginError('signin-error','No account found. Check your username or create a new account.');
-      return;
-    }
-    const user = snap.val();
-    if ((user.username||'').trim().toLowerCase() !== username) {
-      showLoginError('signin-error','No account found. Check your username or create a new account.');
+  fbFetchAndMerge(username, user => {
+    if (!user) {
+      showLoginError('signin-error', 'No account found. Check your username or create a new account.');
       return;
     }
     if (user.password !== password) {
-      showLoginError('signin-error','Incorrect password. Try again or use Forgot password.');
+      showLoginError('signin-error', 'Incorrect password. Try again or use Forgot password.');
       return;
-    }
-    // Cache locally so next login is instant
-    const local = getUsers();
-    if (!local.find(u => u.username.toLowerCase() === username)) {
-      local.push(user); saveUsers(local);
     }
     localStorage.setItem(CURRENT_USER_KEY, username);
     loadAndStart(user);
-  }).catch(() => {
-    showLoginError('signin-error','No account found. Check your username or create a new account.');
   });
+}
+
+// Start session after syncing the user's latest progress from Firebase
+// Use this instead of loadAndStart() directly so progress is always current
+function fbSyncThenStart(localUser, rememberChecked, username, password) {
+  if (rememberChecked) saveRemembered(username, password);
+  else                 clearRemembered();
+  localStorage.setItem(CURRENT_USER_KEY, username);
+  if (!fbDb) { loadAndStart(localUser); return; }
+  // Pull latest progress from Firebase before starting
+  fbFetchAndMerge(username, syncedUser => {
+    loadAndStart(syncedUser || localUser);
+  });
+}
+
+// On page load: pull every account from Firebase and refresh localStorage
+// This covers the auto-login case so returning users see current progress
+function fbSyncAllToLocal(thenCb) {
+  if (!fbDb) { if (thenCb) thenCb(); return; }
+  fbDb.ref('lms_users').once('value').then(snap => {
+    if (!snap.exists()) { if (thenCb) thenCb(); return; }
+    const local    = getUsers();
+    const localMap = {};
+    local.forEach((u, i) => { localMap[(u.username||'').toLowerCase()] = i; });
+    let changed = false;
+    snap.forEach(child => {
+      const fbUser = child.val();
+      if (!fbUser || !fbUser.username) return;
+      const key = (fbUser.username||'').toLowerCase();
+      if (localMap[key] !== undefined) {
+        // Overwrite local with Firebase (progress sync)
+        local[localMap[key]] = Object.assign({}, local[localMap[key]], fbUser);
+        changed = true;
+      } else {
+        local.push(fbUser);
+        localMap[key] = local.length - 1;
+        changed = true;
+      }
+    });
+    if (changed) saveUsers(local);
+    if (thenCb) thenCb();
+  }).catch(() => { if (thenCb) thenCb(); });
 }
 // ══════════════════════════════════════════════════════════════
 
@@ -2911,10 +2947,8 @@ function loginUser() {
   }
   if (user.password !== password)  { showLoginError('signin-error','Incorrect password. Try again or use Forgot password.'); return; }
   const rememberChecked = document.getElementById('remember-me')?.checked;
-  if (rememberChecked) { saveRemembered(username, password); }
-  else                 { clearRemembered(); }
-  localStorage.setItem(CURRENT_USER_KEY, username);
-  loadAndStart(user);
+  // Sync latest progress from Firebase before starting (cross-device progress sync)
+  fbSyncThenStart(user, rememberChecked, username, password);
 }
 
 function registerUser() {
@@ -3905,18 +3939,24 @@ setTimeout(() => {
   // 1. Repair corrupted localStorage + seed default accounts
   seedDefaultUsers();
 
-  // 1b. Pull any accounts from Firebase into localStorage (cross-device sync)
-  fbSyncToLocal();
-
-  // 2. Auto-login if still in an active session
+  // 2. Auto-login or show login screen — always sync from Firebase first so
+  //    progress is current regardless of which device was last used
   const savedUser = getCurrentUser();
   if (savedUser) {
-    const users = getUsers();
-    const user  = users.find(u => (u.username||'').trim().toLowerCase() === savedUser.toLowerCase());
-    if (user) { loadAndStart(user); return; }
-    // Stale session key — clear it
-    localStorage.removeItem(CURRENT_USER_KEY);
+    // Show brief syncing state on welcome screen while Firebase loads
+    const syncMsg = document.getElementById('sync-status');
+    if (syncMsg) syncMsg.style.display = 'block';
+    fbSyncAllToLocal(function() {
+      if (syncMsg) syncMsg.style.display = 'none';
+      const users = getUsers();
+      const user  = users.find(u => (u.username||'').trim().toLowerCase() === savedUser.toLowerCase());
+      if (user) { loadAndStart(user); return; }
+      localStorage.removeItem(CURRENT_USER_KEY); // stale session
+    });
+    return; // wait for Firebase callback above
   }
+  // No saved session — sync accounts so cross-device login lookup works
+  fbSyncAllToLocal(null);
 
   // 3. Pre-fill remembered credentials
   const remembered = loadRemembered();
