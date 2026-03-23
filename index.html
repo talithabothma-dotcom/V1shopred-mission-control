@@ -3704,22 +3704,48 @@ function setSessions(sessions) {
 
 function getOrCreateSession() {
   const sessions = getStoredSessions();
-  // Active session for this agent name in this browser tab (use a tab-scoped ID)
   if (!window._sessionId) window._sessionId = Date.now() + '_' + Math.random().toString(36).slice(2);
+  const username = (getCurrentUser() || '').toLowerCase();
+
+  // First try to find a session for this exact tab/device ID
   let session = sessions.find(s => s._sid === window._sessionId);
+
+  // If not found by _sessionId, look for an existing session by username
+  // (handles returning users on a new page load or new device)
+  if (!session && username) {
+    const userSessions = sessions.filter(s => (s.username || '').toLowerCase() === username);
+    if (userSessions.length > 0) {
+      // Reuse the most recent session so the user appears once in admin
+      session = userSessions.sort((a, b) => new Date(b.startTime || 0) - new Date(a.startTime || 0))[0];
+      window._sessionId = session._sid; // Bind this tab to the existing session
+    }
+  }
+
+  const curRank = RANKS.slice().reverse().find(r => totalXP >= r.min);
   if (!session) {
+    // Brand-new session — initialise with the user's ACTUAL current progress
     session = {
-      _sid: window._sessionId,
-      name: agentName,
-      startTime: new Date().toISOString(),
-      active: true,
-      totalXP: 0,
-      rank: 'Cadet',
-      missionsCompleted: [false, false, false, false],
-      attempts: []
+      _sid:              window._sessionId,
+      username:          username,
+      name:              agentName,
+      startTime:         new Date().toISOString(),
+      active:            true,
+      totalXP:           totalXP,
+      rank:              curRank ? curRank.label : 'Cadet',
+      missionsCompleted: [...missionsDone],
+      attempts:          []
     };
     sessions.push(session);
     setSessions(sessions);
+  } else {
+    // Refresh progress fields so admin always sees the latest data
+    session.username          = username || session.username || '';
+    session.name              = agentName || session.name;
+    session.active            = true;
+    session.totalXP           = totalXP;
+    session.rank              = curRank ? curRank.label : 'Cadet';
+    session.missionsCompleted = [...missionsDone];
+    setSessions(sessions); // pushes updated session to Firebase
   }
   return session;
 }
@@ -3756,7 +3782,8 @@ function saveAttempt(missionIdx, score, passed, questionResults) {
     questionResults: questionResults
   });
 
-  session.totalXP = totalXP;
+  session.username          = (getCurrentUser() || '').toLowerCase() || session.username || '';
+  session.totalXP           = totalXP;
   session.missionsCompleted = [...missionsDone];
   const rank = RANKS.slice().reverse().find(r => totalXP >= r.min);
   session.rank = rank ? rank.label : 'Cadet';
@@ -3770,9 +3797,10 @@ function closeSession() {
   const sessions = getStoredSessions();
   const session = sessions.find(s => s._sid === window._sessionId);
   if (session) {
-    session.active = false;
-    session.endTime = new Date().toISOString();
-    session.totalXP = totalXP;
+    session.username          = (getCurrentUser() || '').toLowerCase() || session.username || '';
+    session.active            = false;
+    session.endTime           = new Date().toISOString();
+    session.totalXP           = totalXP;
     session.missionsCompleted = [...missionsDone];
     const rank = RANKS.slice().reverse().find(r => totalXP >= r.min);
     session.rank = rank ? rank.label : 'Cadet';
@@ -4031,6 +4059,56 @@ function adminLogin() {
   showAdminPortal();
 }
 
+// Ensure every registered user (from lms_users) has at least one session record
+// so they always appear in the admin portal even before they do any training.
+function _ensureUserSessionsExist(users) {
+  const sessions = getStoredSessions();
+  // Build a set of usernames that already have a session
+  const sessionUsernames = new Set(
+    sessions.map(s => (s.username || '').toLowerCase()).filter(Boolean)
+  );
+  let changed = false;
+  users.forEach(u => {
+    if (u.isAdmin) return; // skip admin accounts
+    const uname = (u.username || '').toLowerCase();
+    if (!uname) return;
+    const curRank = RANKS.slice().reverse().find(r => (u.totalXP || 0) >= r.min);
+    if (!sessionUsernames.has(uname)) {
+      // Create a synthetic session so this user appears in admin
+      sessions.push({
+        _sid:              'usr_' + uname.replace(/[^a-z0-9]/g, '_') + '_' + (u.createdAt ? new Date(u.createdAt).getTime() : Date.now()),
+        username:          uname,
+        name:              u.name || u.username,
+        startTime:         u.createdAt || new Date().toISOString(),
+        active:            false,
+        totalXP:           u.totalXP  || 0,
+        rank:              curRank ? curRank.label : 'Cadet',
+        missionsCompleted: u.missionsDone ? [...u.missionsDone] : [false, false, false, false],
+        attempts:          []
+      });
+      sessionUsernames.add(uname);
+      changed = true;
+    } else {
+      // Merge latest user progress into their existing session
+      const idx = sessions.findIndex(s => (s.username || '').toLowerCase() === uname);
+      if (idx !== -1) {
+        const s = sessions[idx];
+        const merged = Object.assign({}, s, {
+          name:    u.name || s.name,
+          totalXP: Math.max(s.totalXP || 0, u.totalXP || 0),
+          rank:    curRank ? curRank.label : (s.rank || 'Cadet'),
+          missionsCompleted: u.missionsDone
+            ? u.missionsDone.map((d, i) => d || (s.missionsCompleted || [])[i] || false)
+            : s.missionsCompleted
+        });
+        sessions[idx] = merged;
+        changed = true;
+      }
+    }
+  });
+  if (changed) localStorage.setItem(LS_KEY, JSON.stringify(sessions));
+}
+
 // Merge a Firebase sessions snapshot into localStorage and re-render admin
 function _applySessionsSnap(snap) {
   if (snap && snap.exists()) {
@@ -4054,21 +4132,71 @@ function showAdminPortal() {
   portal.style.display = 'flex';
 
   if (fbDb) {
-    // One live listener — receives snapshot directly every time any session changes
+    // ── 1. Real-time listener on lms_sessions ──────────────────────────────
     if (!window._adminSessionListener) {
       window._adminSessionListener = true;
       fbDb.ref('lms_sessions').on('value',
         snap => { try { _applySessionsSnap(snap); } catch(e) { _renderAll(); } },
         ()   => { _renderAll(); }
       );
-      // on('value') fires immediately, so no extra call needed
     } else {
-      // Listener already running — just force a fresh read
       fbDb.ref('lms_sessions').once('value')
         .then(snap => _applySessionsSnap(snap))
         .catch(() => _renderAll());
     }
+
+    // ── 2. Real-time listener on lms_users ─────────────────────────────────
+    // Ensures every registered user appears in admin even before they do training
+    if (!window._adminUserListener) {
+      window._adminUserListener = true;
+      fbDb.ref('lms_users').on('value', snap => {
+        if (!snap || !snap.exists()) return;
+        // Pull all remote users into this device's localStorage
+        const local = getUsers();
+        const localMap = {};
+        local.forEach((u, i) => { localMap[(u.username || '').toLowerCase()] = i; });
+        snap.forEach(child => {
+          const u = child.val();
+          if (!u || !u.username) return;
+          const key = u.username.toLowerCase();
+          if (localMap[key] !== undefined) {
+            local[localMap[key]] = Object.assign({}, local[localMap[key]], u);
+          } else {
+            local.push(u);
+            localMap[key] = local.length - 1;
+          }
+        });
+        saveUsers(local);
+        // Create session placeholders for any user who has no session yet
+        _ensureUserSessionsExist(local);
+        _renderAll();
+      }, () => {});
+    } else {
+      // Listener active — just do a one-time refresh to catch any new users
+      fbDb.ref('lms_users').once('value').then(snap => {
+        if (!snap || !snap.exists()) return;
+        const local = getUsers();
+        const localMap = {};
+        local.forEach((u, i) => { localMap[(u.username || '').toLowerCase()] = i; });
+        snap.forEach(child => {
+          const u = child.val();
+          if (!u || !u.username) return;
+          const key = u.username.toLowerCase();
+          if (localMap[key] !== undefined) {
+            local[localMap[key]] = Object.assign({}, local[localMap[key]], u);
+          } else {
+            local.push(u);
+            localMap[key] = local.length - 1;
+          }
+        });
+        saveUsers(local);
+        _ensureUserSessionsExist(local);
+        _renderAll();
+      }).catch(() => {});
+    }
   } else {
+    // Offline / no Firebase — still show any locally cached data
+    _ensureUserSessionsExist(getUsers());
     try { _renderAll(); } catch(e) {}
   }
 }
@@ -4267,7 +4395,39 @@ function renderMissionSnapshot(sessions) {
 // PARTICIPANTS
 // ════════════════════════════════════════════
 function renderParticipants() {
-  const sessions = getSessions();
+  // Deduplicate: one row per user (by username, or name as fallback)
+  // Merge all sessions for the same user — pick the one with most XP,
+  // accumulate all attempts, union missionsCompleted.
+  const rawSessions = getSessions();
+  const userMap = {};
+  rawSessions.forEach(s => {
+    const key = (s.username || s.name || '').toLowerCase();
+    if (!key) return;
+    if (!userMap[key]) {
+      userMap[key] = Object.assign({}, s, { attempts: [...(s.attempts || [])] });
+    } else {
+      const existing = userMap[key];
+      // Keep the session with the highest XP as the base
+      if ((s.totalXP || 0) > (existing.totalXP || 0)) {
+        userMap[key] = Object.assign({}, s, { attempts: [...(existing.attempts || []), ...(s.attempts || [])] });
+      } else {
+        existing.attempts = [...(existing.attempts || []), ...(s.attempts || [])];
+        // Union missionsCompleted
+        if (s.missionsCompleted) {
+          existing.missionsCompleted = (existing.missionsCompleted || [false,false,false,false])
+            .map((d, i) => d || (s.missionsCompleted[i] || false));
+        }
+        // If any session is active, mark as active
+        if (s.active) existing.active = true;
+        // Use earlier startTime
+        if (s.startTime && new Date(s.startTime) < new Date(existing.startTime || Infinity)) {
+          existing.startTime = s.startTime;
+        }
+      }
+    }
+  });
+  const sessions = Object.values(userMap);
+
   const q      = (document.getElementById('p-search')?.value||'').toLowerCase();
   const filter = document.getElementById('p-filter')?.value || 'all';
   const sort   = document.getElementById('p-sort')?.value || 'xp';
@@ -4288,7 +4448,7 @@ function renderParticipants() {
       <div class="empty-icon">👥</div>
       <div class="empty-title">No participants yet</div>
       <div class="empty-sub">Participants will appear here as they start missions in the LMS.</div>
-      <div class="empty-hint">Make sure you open the LMS in the same browser. Click "Load Demo" in the sidebar to see example data.</div>
+      <div class="empty-hint">Participants appear here as soon as they register or log in from any device. Click "Refresh" or "Load Demo" in the sidebar to see example data.</div>
     </div>`;
     return;
   }
@@ -4768,14 +4928,40 @@ function adminClearAllData() {
 // REFRESH
 // ════════════════════════════════════════════
 function refreshAll() {
-  // If Firebase is live, fetch the latest snapshot then render
-  // (The on('value') listener in showAdminPortal handles real-time updates automatically;
-  //  this explicit fetch is for manual Refresh button presses and the auto-refresh timer)
   if (fbDb) {
-    fbDb.ref('lms_sessions').once('value')
-      .then(snap => _applySessionsSnap(snap))
-      .catch(() => _renderAll());
+    // Fetch both sessions AND users so admin gets a complete picture
+    Promise.all([
+      fbDb.ref('lms_sessions').once('value').catch(() => null),
+      fbDb.ref('lms_users').once('value').catch(() => null)
+    ]).then(([sessSnap, usersSnap]) => {
+      // Merge users first so session placeholders are created with correct data
+      if (usersSnap && usersSnap.exists()) {
+        const local = getUsers();
+        const localMap = {};
+        local.forEach((u, i) => { localMap[(u.username || '').toLowerCase()] = i; });
+        usersSnap.forEach(child => {
+          const u = child.val();
+          if (!u || !u.username) return;
+          const key = u.username.toLowerCase();
+          if (localMap[key] !== undefined) {
+            local[localMap[key]] = Object.assign({}, local[localMap[key]], u);
+          } else {
+            local.push(u);
+            localMap[key] = local.length - 1;
+          }
+        });
+        saveUsers(local);
+        _ensureUserSessionsExist(local);
+      }
+      // Then merge sessions
+      if (sessSnap) {
+        _applySessionsSnap(sessSnap);
+      } else {
+        _renderAll();
+      }
+    });
   } else {
+    _ensureUserSessionsExist(getUsers());
     _renderAll();
   }
 }
