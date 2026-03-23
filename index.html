@@ -1526,6 +1526,18 @@
 .admin-login-badge{display:inline-flex;align-items:center;gap:8px;background:rgba(200,16,46,0.12);border:1px solid rgba(200,16,46,0.25);border-radius:20px;padding:5px 14px;margin-bottom:14px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--absa-red);}
 
 </style>
+
+<!-- ═══════════════════════════════════════════════════════════════
+  FIREBASE SDK — enables login from any device / browser / phone
+  Setup guide (5 min, free): https://console.firebase.google.com
+    1. Create project → continue → continue
+    2. Build → Realtime Database → Create database → Start in TEST MODE
+    3. Project Settings (gear icon) → Your apps → </> (Web) → Register app
+    4. Copy the firebaseConfig values into the FB_CONFIG block in the
+       second <script> tag below (search for "PASTE_YOUR")
+═══════════════════════════════════════════════════════════════ -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 </head>
 <body>
 
@@ -1547,7 +1559,6 @@
       <div class="login-tabs" id="login-tabs-row">
         <button class="login-tab active" id="tab-signin" onclick="switchTab('signin')">Sign In</button>
         <button class="login-tab" id="tab-register" onclick="switchTab('register')">New Account</button>
-        <button class="login-tab" id="tab-code" onclick="switchTab('code')">Use Code</button>
       </div>
 
       <!-- Sign In -->
@@ -1593,19 +1604,7 @@
         <button class="btn-primary" onclick="registerUser()">Create Account →</button>
       </div>
 
-      <!-- Use Code — cross-device login -->
-      <div id="form-code" style="display:none">
-  <div class="form-group">
-    <label class="form-lbl">Login Code</label>
-    <textarea id="code-input" rows="3" placeholder="Paste your login code here…"
-      style="width:100%;background:#1A1A1A;border:1px solid #333;color:#fff;border-radius:8px;padding:10px;font-size:13px;resize:vertical;font-family:monospace;"></textarea>
-  </div>
-  <div id="code-error" class="form-error" style="display:none"></div>
-  <button class="btn-primary" onclick="loginWithCode()" style="width:100%;margin-top:8px">Restore &amp; Sign In →</button>
-  <p style="font-size:11px;color:#666;margin-top:10px;text-align:center;">Get your login code from <strong>Profile → Export Code</strong> on your original device.</p>
-</div>
-
-<div id="form-forgot" style="display:none">
+      <div id="form-forgot" style="display:none">
         <div style="font-family:'Barlow Condensed',sans-serif;font-size:18px;font-weight:700;margin-bottom:14px;">Reset Password</div>
         <div id="forgot-error" class="login-error"></div>
         <div id="forgot-success" class="login-success"></div>
@@ -2727,6 +2726,94 @@ const USERS_KEY        = 'shopred_lms_users_v1';
 const CURRENT_USER_KEY = 'shopred_lms_current_user_v1';
 const REMEMBER_KEY     = 'shopred_lms_remember_v1';
 
+// ══════════════════════════════════════════════════════════════
+// FIREBASE — cross-device login sync
+// Paste your Firebase project values below (see setup guide in <head>)
+// App works on localStorage-only until Firebase is configured.
+// ══════════════════════════════════════════════════════════════
+const FB_CONFIG = {
+  apiKey:            "AIzaSyAATlS81sEbX3OUHY9YpcXT6oMILD1640M",
+  authDomain:        "littlefish-lmsshopred.firebaseapp.com",
+  databaseURL:       "https://littlefish-lmsshopred-default-rtdb.firebaseio.com",
+  projectId:         "littlefish-lmsshopred",
+  storageBucket:     "littlefish-lmsshopred.firebasestorage.app",
+  messagingSenderId: "631618864700",
+  appId:             "1:631618864700:web:f2b0d2a6f4bc0c828e2539"
+};
+const FB_LIVE = FB_CONFIG.apiKey !== "PASTE_YOUR_API_KEY";
+let   fbDb    = null;
+if (FB_LIVE) {
+  try {
+    if (!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
+    fbDb = firebase.database();
+    console.log('[LMS] Firebase connected — cross-device sync active');
+  } catch(e) { console.warn('[LMS] Firebase init error:', e); }
+}
+
+// Safe key for Firebase paths (replace disallowed chars)
+function fbKey(username) { return btoa(username.toLowerCase()).replace(/[.#$/\[\]]/g,'_'); }
+
+// Write one user record to Firebase (non-blocking)
+function fbPushUser(user) {
+  if (!fbDb) return;
+  const safe = Object.assign({}, user);
+  fbDb.ref('lms_users/' + fbKey(user.username)).set(safe).catch(() => {});
+}
+
+// Merge Firebase users into localStorage (called on page load)
+function fbSyncToLocal() {
+  if (!fbDb) return;
+  fbDb.ref('lms_users').once('value').then(snap => {
+    if (!snap.exists()) return;
+    const local    = getUsers();
+    const localMap = {};
+    local.forEach(u => { localMap[u.username.toLowerCase()] = true; });
+    let changed = false;
+    snap.forEach(child => {
+      const u = child.val();
+      if (u && u.username && !localMap[u.username.toLowerCase()]) {
+        local.push(u);
+        localMap[u.username.toLowerCase()] = true;
+        changed = true;
+      }
+    });
+    if (changed) { saveUsers(local); console.log('[LMS] Synced accounts from Firebase'); }
+  }).catch(() => {});
+}
+
+// Attempt Firebase login if user not found in localStorage
+function fbLoginFallback(username, password) {
+  if (!fbDb) {
+    showLoginError('signin-error','No account found. Check your username or create a new account.');
+    return;
+  }
+  fbDb.ref('lms_users/' + fbKey(username)).once('value').then(snap => {
+    if (!snap.exists()) {
+      showLoginError('signin-error','No account found. Check your username or create a new account.');
+      return;
+    }
+    const user = snap.val();
+    if ((user.username||'').trim().toLowerCase() !== username) {
+      showLoginError('signin-error','No account found. Check your username or create a new account.');
+      return;
+    }
+    if (user.password !== password) {
+      showLoginError('signin-error','Incorrect password. Try again or use Forgot password.');
+      return;
+    }
+    // Cache locally so next login is instant
+    const local = getUsers();
+    if (!local.find(u => u.username.toLowerCase() === username)) {
+      local.push(user); saveUsers(local);
+    }
+    localStorage.setItem(CURRENT_USER_KEY, username);
+    loadAndStart(user);
+  }).catch(() => {
+    showLoginError('signin-error','No account found. Check your username or create a new account.');
+  });
+}
+// ══════════════════════════════════════════════════════════════
+
 function getUsers()         { try { return JSON.parse(localStorage.getItem(USERS_KEY)||'[]'); } catch(e){ return []; } }
 function saveUsers(u)       { localStorage.setItem(USERS_KEY, JSON.stringify(u)); }
 function getCurrentUser()   { return localStorage.getItem(CURRENT_USER_KEY)||null; }
@@ -2741,72 +2828,11 @@ function loadRemembered() {
   try { return JSON.parse(localStorage.getItem(REMEMBER_KEY)||'null'); } catch(e){ return null; }
 }
 
-function loginWithCode() {
-  const raw = (document.getElementById('code-input').value||'').trim();
-  if (!raw) { showLoginError('code-error','Please paste your login code.'); return; }
-  try {
-    const data = JSON.parse(atob(raw));
-    if (!data.u || !data.p || !data.n) throw new Error('Invalid code');
-    seedDefaultUsers();
-    const users = getUsers();
-    const exists = users.find(u => (u.username||'').trim().toLowerCase() === data.u.toLowerCase());
-    if (exists) {
-      // Account already exists on this device — just log in
-      localStorage.setItem(CURRENT_USER_KEY, data.u.toLowerCase());
-      loadAndStart(exists);
-      return;
-    }
-    // Restore account from code
-    const restored = {
-      username: data.u.toLowerCase(),
-      password: data.p,
-      name: data.n,
-      totalXP: data.xp || 0,
-      missionsDone: data.md || [false,false,false,false],
-      rank: data.r || 'Cadet',
-      createdAt: data.ca || new Date().toISOString()
-    };
-    users.push(restored);
-    saveUsers(users);
-    localStorage.setItem(CURRENT_USER_KEY, restored.username);
-    loadAndStart(restored);
-  } catch(e) {
-    showLoginError('code-error','Invalid login code. Please copy it again from your original device.');
-  }
-}
-
-function exportProfileCode() {
-  const uname = getCurrentUser();
-  if (!uname) return;
-  const users = getUsers();
-  const u = users.find(u2 => (u2.username||'').toLowerCase() === uname.toLowerCase());
-  if (!u) return;
-  const payload = {
-    u: u.username, p: u.password, n: u.name,
-    xp: u.totalXP||0, md: u.missionsDone||[false,false,false,false],
-    r: u.rank||'Cadet', ca: u.createdAt||''
-  };
-  const code = btoa(JSON.stringify(payload));
-  // Show in a modal-style overlay
-  const overlay = document.createElement('div');
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px;';
-  overlay.innerHTML = \`
-    <div style="background:#1A1A1A;border:1px solid #333;border-radius:12px;padding:24px;max-width:400px;width:100%;text-align:center;">
-      <div style="font-size:18px;font-weight:700;color:#fff;margin-bottom:8px;">Your Login Code</div>
-      <div style="font-size:12px;color:#888;margin-bottom:16px;">Copy this code and paste it on your other device under <strong style="color:#ccc">Sign In → Use Code</strong></div>
-      <textarea readonly rows="4" style="width:100%;background:#0A0A0A;border:1px solid #444;color:#eee;border-radius:8px;padding:10px;font-family:monospace;font-size:11px;resize:none;" onclick="this.select()">\${code}</textarea>
-      <button onclick="navigator.clipboard&&navigator.clipboard.writeText('\${code}').then(()=>this.textContent='Copied!').catch(()=>{})" style="background:#C8102E;color:#fff;border:none;border-radius:6px;padding:10px 20px;font-weight:700;cursor:pointer;margin-top:12px;width:100%;">Copy to Clipboard</button>
-      <button onclick="this.closest('div[style]').remove()" style="background:transparent;color:#666;border:none;cursor:pointer;margin-top:10px;font-size:13px;">Close</button>
-    </div>
-  \`;
-  document.body.appendChild(overlay);
-}
-
 function switchTab(tab) {
   // Hide tabs row only on 'forgot' screen
   const tabsRow = document.getElementById('login-tabs-row');
   if (tabsRow) tabsRow.style.display = tab === 'forgot' ? 'none' : 'flex';
-  ['signin','register','forgot','code'].forEach(t => {
+  ['signin','register','forgot'].forEach(t => {
     const btn = document.getElementById('tab-' + t);
     if (btn) btn.classList.toggle('active', t === tab);
     const form = document.getElementById('form-' + t);
@@ -2866,6 +2892,8 @@ function seedDefaultUsers() {
         rank: 'Cadet'
       });
       saveUsers(users);
+      // Push admin to Firebase so it exists on all devices
+      fbPushUser(users[users.length - 1]);
     }
   } catch(e) { console.warn('seedDefaultUsers error:', e); }
 }
@@ -2875,9 +2903,12 @@ function loginUser() {
   const password = (document.getElementById('signin-password').value||'');
   if (!username || !password) { showLoginError('signin-error','Please enter your username and password.'); return; }
   const users = getUsers();
-  // Strict match on normalised username
   const user = users.find(u => (u.username||'').trim().toLowerCase() === username);
-  if (!user)                       { showLoginError('signin-error','No account found. Check your username or create a new account.'); return; }
+  if (!user) {
+    // Not in localStorage — try Firebase (cross-device fallback)
+    fbLoginFallback(username, password);
+    return;
+  }
   if (user.password !== password)  { showLoginError('signin-error','Incorrect password. Try again or use Forgot password.'); return; }
   const rememberChecked = document.getElementById('remember-me')?.checked;
   if (rememberChecked) { saveRemembered(username, password); }
@@ -2908,6 +2939,7 @@ function registerUser() {
   };
   users.push(newUser);
   saveUsers(users);
+  fbPushUser(newUser); // sync to Firebase for cross-device access
   localStorage.setItem(CURRENT_USER_KEY, username);
   loadAndStart(newUser);
 }
@@ -2980,6 +3012,7 @@ function saveUserProgress() {
   users[idx].missionsDone = [...missionsDone];
   users[idx].rank         = RANKS.slice().reverse().find(r => totalXP >= r.min)?.label || 'Cadet';
   saveUsers(users);
+  fbPushUser(users[idx]); // keep Firebase in sync so other devices see updated progress
 }
 
 // Enter-key support for login forms
@@ -3871,6 +3904,9 @@ setTimeout(() => {
 (function() {
   // 1. Repair corrupted localStorage + seed default accounts
   seedDefaultUsers();
+
+  // 1b. Pull any accounts from Firebase into localStorage (cross-device sync)
+  fbSyncToLocal();
 
   // 2. Auto-login if still in an active session
   const savedUser = getCurrentUser();
