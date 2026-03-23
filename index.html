@@ -3693,11 +3693,11 @@ function getStoredSessions() {
 }
 function setSessions(sessions) {
   localStorage.setItem(LS_KEY, JSON.stringify(sessions));
-  // Push the current session record to Firebase so admin sees it on any device
-  if (window._sessionId && fbDb) {
+  // Push this user's current session to Firebase so admin sees it on every device
+  if (fbDb && window._sessionId) {
     const cur = sessions.find(s => s._sid === window._sessionId);
     if (cur) {
-      try { fbDb.ref('lms_sessions/' + window._sessionId).set(cur); } catch(e) {}
+      fbDb.ref('lms_sessions/' + window._sessionId).set(cur).catch(() => {});
     }
   }
 }
@@ -4031,16 +4031,45 @@ function adminLogin() {
   showAdminPortal();
 }
 
+// Merge a Firebase sessions snapshot into localStorage and re-render admin
+function _applySessionsSnap(snap) {
+  if (snap && snap.exists()) {
+    const local    = getStoredSessions();
+    const localMap = {};
+    local.forEach((s, i) => { if (s._sid) localMap[s._sid] = i; });
+    snap.forEach(child => {
+      const fb = child.val();
+      if (!fb || !fb._sid) return;
+      if (localMap[fb._sid] !== undefined) { local[localMap[fb._sid]] = fb; }
+      else { localMap[fb._sid] = local.length; local.push(fb); }
+    });
+    localStorage.setItem(LS_KEY, JSON.stringify(local));
+  }
+  _renderAll();
+}
+
 function showAdminPortal() {
   document.querySelectorAll('.screen').forEach(s => { s.style.display = 'none'; });
   const portal = document.getElementById('admin-portal');
   portal.style.display = 'flex';
-  try { refreshAll(); } catch(e) { console.error('Admin render error:', e); }
-  // Live listener: auto-refresh admin view whenever any session changes in Firebase
-  if (fbDb && !window._adminSessionListener) {
-    window._adminSessionListener = fbDb.ref('lms_sessions').on('value', () => {
-      try { refreshAll(); } catch(e) {}
-    }, () => {});
+
+  if (fbDb) {
+    // One live listener — receives snapshot directly every time any session changes
+    if (!window._adminSessionListener) {
+      window._adminSessionListener = true;
+      fbDb.ref('lms_sessions').on('value',
+        snap => { try { _applySessionsSnap(snap); } catch(e) { _renderAll(); } },
+        ()   => { _renderAll(); }
+      );
+      // on('value') fires immediately, so no extra call needed
+    } else {
+      // Listener already running — just force a fresh read
+      fbDb.ref('lms_sessions').once('value')
+        .then(snap => _applySessionsSnap(snap))
+        .catch(() => _renderAll());
+    }
+  } else {
+    try { _renderAll(); } catch(e) {}
   }
 }
 
@@ -4739,29 +4768,13 @@ function adminClearAllData() {
 // REFRESH
 // ════════════════════════════════════════════
 function refreshAll() {
-  // Pull sessions from Firebase first, then render with the merged result
+  // If Firebase is live, fetch the latest snapshot then render
+  // (The on('value') listener in showAdminPortal handles real-time updates automatically;
+  //  this explicit fetch is for manual Refresh button presses and the auto-refresh timer)
   if (fbDb) {
-    fbDb.ref('lms_sessions').once('value').then(snap => {
-      if (snap.exists()) {
-        const local    = getStoredSessions();
-        const localMap = {};
-        local.forEach((s, i) => { if (s._sid) localMap[s._sid] = i; });
-        let changed = false;
-        snap.forEach(child => {
-          const fbSess = child.val();
-          if (!fbSess || !fbSess._sid) return;
-          if (localMap[fbSess._sid] !== undefined) {
-            local[localMap[fbSess._sid]] = fbSess;
-          } else {
-            local.push(fbSess);
-            localMap[fbSess._sid] = local.length - 1;
-          }
-          changed = true;
-        });
-        if (changed) setSessions(local);
-      }
-      _renderAll();
-    }).catch(() => _renderAll());
+    fbDb.ref('lms_sessions').once('value')
+      .then(snap => _applySessionsSnap(snap))
+      .catch(() => _renderAll());
   } else {
     _renderAll();
   }
