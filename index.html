@@ -2754,110 +2754,90 @@ if (FB_LIVE) {
 function fbKey(username) { return btoa(username.toLowerCase()).replace(/[.#$/\[\]]/g,'_'); }
 
 // Write one user record to Firebase (non-blocking)
-// Write user to Firebase (non-blocking — called on every progress save)
+// ── Firebase helpers ────────────────────────────────────────────────────────
+
+// Push one user record to Firebase (fire-and-forget, never blocks)
 function fbPushUser(user) {
   if (!fbDb) return;
-  fbDb.ref('lms_users/' + fbKey(user.username)).set(Object.assign({}, user)).catch(() => {});
+  try { fbDb.ref('lms_users/' + fbKey(user.username)).set(Object.assign({}, user)); } catch(e) {}
 }
 
-// Fetch a single user from Firebase and merge into localStorage, then call cb(mergedUser)
-// Firebase is the source of truth for progress — local cache is secondary
-function fbFetchAndMerge(username, cb) {
+// Fetch a single user from Firebase (one-time read) and cache in localStorage
+// cb(user) called with the record, or cb(null) if not found / error
+function fbGetUser(username, cb) {
   if (!fbDb) { cb(null); return; }
-  fbDb.ref('lms_users/' + fbKey(username)).once('value').then(snap => {
-    if (!snap.exists()) { cb(null); return; }
+  fbDb.ref('lms_users/' + fbKey(username)).once('value')
+    .then(snap => {
+      if (!snap.exists()) { cb(null); return; }
+      const u = snap.val();
+      if (!u || !u.username) { cb(null); return; }
+      // Cache in localStorage
+      const local = getUsers();
+      const idx = local.findIndex(l => (l.username||'').toLowerCase() === username.toLowerCase());
+      if (idx !== -1) { local[idx] = Object.assign({}, local[idx], u); }
+      else            { local.push(u); }
+      saveUsers(local);
+      cb(idx !== -1 ? local[idx] : u);
+    })
+    .catch(() => cb(null));
+}
+
+// Set up a real-time listener on the logged-in user's Firebase record.
+// Whenever another device saves progress, this updates localStorage + live state.
+let _fbProgressListener = null;
+function fbWatchUserProgress(username) {
+  if (!fbDb) return;
+  if (_fbProgressListener) { _fbProgressListener(); _fbProgressListener = null; }
+  const ref = fbDb.ref('lms_users/' + fbKey(username));
+  const handler = ref.on('value', snap => {
+    if (!snap.exists()) return;
     const fbUser = snap.val();
-    if (!fbUser || !fbUser.username) { cb(null); return; }
-    // Update localStorage with the authoritative Firebase record
+    if (!fbUser || !fbUser.username) return;
+    // Merge into localStorage
     const local = getUsers();
-    const idx   = local.findIndex(u => (u.username||'').toLowerCase() === username.toLowerCase());
+    const idx = local.findIndex(l => (l.username||'').toLowerCase() === username.toLowerCase());
     if (idx !== -1) {
       local[idx] = Object.assign({}, local[idx], fbUser);
       saveUsers(local);
-      cb(local[idx]);
-    } else {
-      local.push(fbUser);
-      saveUsers(local);
-      cb(fbUser);
-    }
-  }).catch(() => cb(null));
-}
-
-// Login via Firebase when account not in localStorage (first login on this device)
-function fbLoginFallback(username, password) {
-  if (!fbDb) {
-    showLoginError('signin-error', 'No account found. Check your username or create a new account.');
-    return;
-  }
-  // Show a subtle in-button state while Firebase responds
-  const btn = document.querySelector('#form-signin .btn-primary');
-  const origText = btn ? btn.textContent : null;
-  if (btn) btn.textContent = 'Checking…';
-  let done = false;
-  const timeout = setTimeout(() => {
-    if (!done) {
-      done = true;
-      if (btn) btn.textContent = origText;
-      showLoginError('signin-error', 'No account found. Check your username or create a new account.');
-    }
-  }, 6000);
-  fbFetchAndMerge(username, user => {
-    clearTimeout(timeout);
-    if (done) return;
-    done = true;
-    if (btn) btn.textContent = origText;
-    if (!user) { showLoginError('signin-error', 'No account found. Check your username or create a new account.'); return; }
-    if (user.password !== password) { showLoginError('signin-error', 'Incorrect password. Try again or use Forgot password.'); return; }
-    localStorage.setItem(CURRENT_USER_KEY, username);
-    loadAndStart(user);
-  });
-}
-
-// Start session after syncing the user's latest progress from Firebase.
-// Has a 4 s timeout so a slow/unavailable Firebase never blocks login.
-function fbSyncThenStart(localUser, rememberChecked, username, password) {
-  if (rememberChecked) saveRemembered(username, password);
-  else                 clearRemembered();
-  localStorage.setItem(CURRENT_USER_KEY, username);
-  if (!fbDb) { loadAndStart(localUser); return; }
-  let started = false;
-  // Safety net: if Firebase takes > 4 s, start with local data immediately
-  const timeout = setTimeout(() => {
-    if (!started) { started = true; loadAndStart(localUser); }
-  }, 4000);
-  fbFetchAndMerge(username, syncedUser => {
-    clearTimeout(timeout);
-    if (!started) { started = true; loadAndStart(syncedUser || localUser); }
-  });
-}
-
-// On page load: pull every account from Firebase and refresh localStorage
-// This covers the auto-login case so returning users see current progress
-function fbSyncAllToLocal(thenCb) {
-  if (!fbDb) { if (thenCb) thenCb(); return; }
-  fbDb.ref('lms_users').once('value').then(snap => {
-    if (!snap.exists()) { if (thenCb) thenCb(); return; }
-    const local    = getUsers();
-    const localMap = {};
-    local.forEach((u, i) => { localMap[(u.username||'').toLowerCase()] = i; });
-    let changed = false;
-    snap.forEach(child => {
-      const fbUser = child.val();
-      if (!fbUser || !fbUser.username) return;
-      const key = (fbUser.username||'').toLowerCase();
-      if (localMap[key] !== undefined) {
-        // Overwrite local with Firebase (progress sync)
-        local[localMap[key]] = Object.assign({}, local[localMap[key]], fbUser);
-        changed = true;
-      } else {
-        local.push(fbUser);
-        localMap[key] = local.length - 1;
-        changed = true;
+      // If this is the current active user, silently update in-memory XP/progress
+      const cur = getCurrentUser();
+      if (cur && cur.toLowerCase() === username.toLowerCase()) {
+        if (fbUser.totalXP !== undefined && fbUser.totalXP !== totalXP) {
+          totalXP = fbUser.totalXP;
+          missionsDone = fbUser.missionsDone ? [...fbUser.missionsDone] : missionsDone;
+        }
       }
-    });
-    if (changed) saveUsers(local);
-    if (thenCb) thenCb();
-  }).catch(() => { if (thenCb) thenCb(); });
+    }
+  }, () => {});
+  _fbProgressListener = () => ref.off('value', handler);
+}
+
+// Pull all user accounts from Firebase into localStorage (background, no callback needed)
+function fbSyncAllBackground() {
+  if (!fbDb) return;
+  fbDb.ref('lms_users').once('value')
+    .then(snap => {
+      if (!snap.exists()) return;
+      const local    = getUsers();
+      const localMap = {};
+      local.forEach((u, i) => { localMap[(u.username||'').toLowerCase()] = i; });
+      let changed = false;
+      snap.forEach(child => {
+        const u = child.val();
+        if (!u || !u.username) return;
+        const key = (u.username||'').toLowerCase();
+        if (localMap[key] !== undefined) {
+          local[localMap[key]] = Object.assign({}, local[localMap[key]], u);
+          changed = true;
+        } else {
+          local.push(u);
+          localMap[key] = local.length - 1;
+          changed = true;
+        }
+      });
+      if (changed) saveUsers(local);
+    })
+    .catch(() => {});
 }
 // ══════════════════════════════════════════════════════════════
 
@@ -2949,17 +2929,46 @@ function loginUser() {
   const username = (document.getElementById('signin-username').value||'').trim().toLowerCase();
   const password = (document.getElementById('signin-password').value||'');
   if (!username || !password) { showLoginError('signin-error','Please enter your username and password.'); return; }
+
   const users = getUsers();
-  const user = users.find(u => (u.username||'').trim().toLowerCase() === username);
-  if (!user) {
-    // Not in localStorage — try Firebase (cross-device fallback)
-    fbLoginFallback(username, password);
+  const localUser = users.find(u => (u.username||'').trim().toLowerCase() === username);
+
+  if (localUser) {
+    // Account exists locally — log in immediately, no waiting
+    if (localUser.password !== password) {
+      showLoginError('signin-error','Incorrect password. Try again or use Forgot password.');
+      return;
+    }
+    const rememberChecked = document.getElementById('remember-me')?.checked;
+    if (rememberChecked) saveRemembered(username, password);
+    else                 clearRemembered();
+    localStorage.setItem(CURRENT_USER_KEY, username);
+    loadAndStart(localUser);
+    // After starting, attach real-time Firebase listener to keep progress in sync
+    fbWatchUserProgress(username);
     return;
   }
-  if (user.password !== password)  { showLoginError('signin-error','Incorrect password. Try again or use Forgot password.'); return; }
-  const rememberChecked = document.getElementById('remember-me')?.checked;
-  // Sync latest progress from Firebase before starting (cross-device progress sync)
-  fbSyncThenStart(user, rememberChecked, username, password);
+
+  // Not in localStorage — first time on this device, fetch from Firebase
+  const btn = document.querySelector('#form-signin .btn-primary');
+  if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
+  fbGetUser(username, fbUser => {
+    if (btn) { btn.disabled = false; btn.textContent = 'Sign In →'; }
+    if (!fbUser) {
+      showLoginError('signin-error','No account found. Check your username or create a new account.');
+      return;
+    }
+    if (fbUser.password !== password) {
+      showLoginError('signin-error','Incorrect password. Try again or use Forgot password.');
+      return;
+    }
+    const rememberChecked = document.getElementById('remember-me')?.checked;
+    if (rememberChecked) saveRemembered(username, password);
+    else                 clearRemembered();
+    localStorage.setItem(CURRENT_USER_KEY, username);
+    loadAndStart(fbUser);
+    fbWatchUserProgress(username);
+  });
 }
 
 function registerUser() {
@@ -2987,6 +2996,7 @@ function registerUser() {
   fbPushUser(newUser); // sync to Firebase for cross-device access
   localStorage.setItem(CURRENT_USER_KEY, username);
   loadAndStart(newUser);
+  fbWatchUserProgress(username); // attach live progress listener
 }
 
 function resetPassword() {
@@ -3950,16 +3960,19 @@ setTimeout(() => {
   // 1. Repair corrupted localStorage + seed default accounts
   seedDefaultUsers();
 
-  // 2. Fire-and-forget Firebase sync — runs in background, never blocks the UI.
-  //    Updates localStorage so progress is current on the NEXT interaction.
-  fbSyncAllToLocal(null);
+  // 2. Background Firebase sync — pulls all accounts silently, never blocks UI
+  fbSyncAllBackground();
 
-  // 3. Auto-login immediately from localStorage (instant — no waiting for Firebase)
+  // 3. Auto-login instantly from localStorage
   const savedUser = getCurrentUser();
   if (savedUser) {
     const users = getUsers();
     const user  = users.find(u => (u.username||'').trim().toLowerCase() === savedUser.toLowerCase());
-    if (user) { loadAndStart(user); return; }
+    if (user) {
+      loadAndStart(user);
+      fbWatchUserProgress(savedUser); // attach live progress listener
+      return;
+    }
     localStorage.removeItem(CURRENT_USER_KEY); // stale session
   }
 
