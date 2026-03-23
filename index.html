@@ -1546,10 +1546,6 @@
 ══════════════════════════════════════════ -->
 <div id="welcome-screen" class="screen active">
   <div class="welcome-bg-lines"></div>
-  <!-- Sync indicator: shown briefly while Firebase loads a returning user's session -->
-  <div id="sync-status" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:rgba(200,16,46,0.92);color:#fff;text-align:center;font-size:13px;font-weight:600;letter-spacing:0.5px;padding:10px;">
-    ⟳ Syncing your account…
-  </div>
   <div class="welcome-content">
     <div class="absa-badge">
       <div class="absa-badge-dot"></div>
@@ -2793,30 +2789,45 @@ function fbLoginFallback(username, password) {
     showLoginError('signin-error', 'No account found. Check your username or create a new account.');
     return;
   }
-  fbFetchAndMerge(username, user => {
-    if (!user) {
+  // Show a subtle in-button state while Firebase responds
+  const btn = document.querySelector('#form-signin .btn-primary');
+  const origText = btn ? btn.textContent : null;
+  if (btn) btn.textContent = 'Checking…';
+  let done = false;
+  const timeout = setTimeout(() => {
+    if (!done) {
+      done = true;
+      if (btn) btn.textContent = origText;
       showLoginError('signin-error', 'No account found. Check your username or create a new account.');
-      return;
     }
-    if (user.password !== password) {
-      showLoginError('signin-error', 'Incorrect password. Try again or use Forgot password.');
-      return;
-    }
+  }, 6000);
+  fbFetchAndMerge(username, user => {
+    clearTimeout(timeout);
+    if (done) return;
+    done = true;
+    if (btn) btn.textContent = origText;
+    if (!user) { showLoginError('signin-error', 'No account found. Check your username or create a new account.'); return; }
+    if (user.password !== password) { showLoginError('signin-error', 'Incorrect password. Try again or use Forgot password.'); return; }
     localStorage.setItem(CURRENT_USER_KEY, username);
     loadAndStart(user);
   });
 }
 
-// Start session after syncing the user's latest progress from Firebase
-// Use this instead of loadAndStart() directly so progress is always current
+// Start session after syncing the user's latest progress from Firebase.
+// Has a 4 s timeout so a slow/unavailable Firebase never blocks login.
 function fbSyncThenStart(localUser, rememberChecked, username, password) {
   if (rememberChecked) saveRemembered(username, password);
   else                 clearRemembered();
   localStorage.setItem(CURRENT_USER_KEY, username);
   if (!fbDb) { loadAndStart(localUser); return; }
-  // Pull latest progress from Firebase before starting
+  let started = false;
+  // Safety net: if Firebase takes > 4 s, start with local data immediately
+  const timeout = setTimeout(() => {
+    if (!started) { started = true; loadAndStart(localUser); }
+  }, 4000);
   fbFetchAndMerge(username, syncedUser => {
-    loadAndStart(syncedUser || localUser);
+    clearTimeout(timeout);
+    if (!started) { started = true; loadAndStart(syncedUser || localUser); }
   });
 }
 
@@ -3939,24 +3950,18 @@ setTimeout(() => {
   // 1. Repair corrupted localStorage + seed default accounts
   seedDefaultUsers();
 
-  // 2. Auto-login or show login screen — always sync from Firebase first so
-  //    progress is current regardless of which device was last used
+  // 2. Fire-and-forget Firebase sync — runs in background, never blocks the UI.
+  //    Updates localStorage so progress is current on the NEXT interaction.
+  fbSyncAllToLocal(null);
+
+  // 3. Auto-login immediately from localStorage (instant — no waiting for Firebase)
   const savedUser = getCurrentUser();
   if (savedUser) {
-    // Show brief syncing state on welcome screen while Firebase loads
-    const syncMsg = document.getElementById('sync-status');
-    if (syncMsg) syncMsg.style.display = 'block';
-    fbSyncAllToLocal(function() {
-      if (syncMsg) syncMsg.style.display = 'none';
-      const users = getUsers();
-      const user  = users.find(u => (u.username||'').trim().toLowerCase() === savedUser.toLowerCase());
-      if (user) { loadAndStart(user); return; }
-      localStorage.removeItem(CURRENT_USER_KEY); // stale session
-    });
-    return; // wait for Firebase callback above
+    const users = getUsers();
+    const user  = users.find(u => (u.username||'').trim().toLowerCase() === savedUser.toLowerCase());
+    if (user) { loadAndStart(user); return; }
+    localStorage.removeItem(CURRENT_USER_KEY); // stale session
   }
-  // No saved session — sync accounts so cross-device login lookup works
-  fbSyncAllToLocal(null);
 
   // 3. Pre-fill remembered credentials
   const remembered = loadRemembered();
