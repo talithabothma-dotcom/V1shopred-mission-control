@@ -3693,6 +3693,13 @@ function getStoredSessions() {
 }
 function setSessions(sessions) {
   localStorage.setItem(LS_KEY, JSON.stringify(sessions));
+  // Push the current session record to Firebase so admin sees it on any device
+  if (window._sessionId && fbDb) {
+    const cur = sessions.find(s => s._sid === window._sessionId);
+    if (cur) {
+      try { fbDb.ref('lms_sessions/' + window._sessionId).set(cur); } catch(e) {}
+    }
+  }
 }
 
 function getOrCreateSession() {
@@ -4025,13 +4032,16 @@ function adminLogin() {
 }
 
 function showAdminPortal() {
-  // Hide all LMS screens
   document.querySelectorAll('.screen').forEach(s => { s.style.display = 'none'; });
-  // Show admin portal (position:fixed so it covers everything)
   const portal = document.getElementById('admin-portal');
   portal.style.display = 'flex';
-  // Render admin content
   try { refreshAll(); } catch(e) { console.error('Admin render error:', e); }
+  // Live listener: auto-refresh admin view whenever any session changes in Firebase
+  if (fbDb && !window._adminSessionListener) {
+    window._adminSessionListener = fbDb.ref('lms_sessions').on('value', () => {
+      try { refreshAll(); } catch(e) {}
+    }, () => {});
+  }
 }
 
 function adminLogout() {
@@ -4720,6 +4730,7 @@ function openClearConfirm()  { document.getElementById('clear-overlay').classLis
 function adminCloseClearConfirm() { document.getElementById('clear-overlay').classList.remove('show'); }
 function adminClearAllData() {
   localStorage.removeItem(LS_KEY);
+  if (fbDb) { try { fbDb.ref('lms_sessions').remove(); } catch(e) {} }
   adminCloseClearConfirm();
   refreshAll();
 }
@@ -4728,6 +4739,34 @@ function adminClearAllData() {
 // REFRESH
 // ════════════════════════════════════════════
 function refreshAll() {
+  // Pull sessions from Firebase first, then render with the merged result
+  if (fbDb) {
+    fbDb.ref('lms_sessions').once('value').then(snap => {
+      if (snap.exists()) {
+        const local    = getStoredSessions();
+        const localMap = {};
+        local.forEach((s, i) => { if (s._sid) localMap[s._sid] = i; });
+        let changed = false;
+        snap.forEach(child => {
+          const fbSess = child.val();
+          if (!fbSess || !fbSess._sid) return;
+          if (localMap[fbSess._sid] !== undefined) {
+            local[localMap[fbSess._sid]] = fbSess;
+          } else {
+            local.push(fbSess);
+            localMap[fbSess._sid] = local.length - 1;
+          }
+          changed = true;
+        });
+        if (changed) setSessions(local);
+      }
+      _renderAll();
+    }).catch(() => _renderAll());
+  } else {
+    _renderAll();
+  }
+}
+function _renderAll() {
   const sessions = getSessions();
   renderOverview(sessions);
   const activeView = document.querySelector('.view.active')?.id;
