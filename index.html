@@ -1087,7 +1087,31 @@
   --text1:     #EFEFEF;
 }
 *{margin:0;padding:0;box-sizing:border-box;}
-#admin-portal{display:none;position:fixed;inset:0;z-index:5000;background:var(--bg,#0A0A0A);overflow-y:auto;overflow-x:hidden;font-family:'Barlow',sans-serif;color:var(--text,#EFEFEF);}
+/* ── ADMIN PORTAL FULL-SCREEN OVERLAY ── */
+#admin-portal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  background: #0A0A0A;
+  flex-direction: row;
+  overflow: hidden;
+}
+/* Override sidebar: in-flow flex item instead of fixed */
+#admin-portal #sidebar {
+  position: relative !important;
+  height: 100vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+/* Override main: no left-margin needed since sidebar is in-flow */
+#admin-portal #main {
+  margin-left: 0 !important;
+  height: 100vh;
+  overflow-y: auto;
+  flex: 1;
+  min-width: 0;
+}
 ::-webkit-scrollbar{width:4px;height:4px;}
 ::-webkit-scrollbar-track{background:transparent;}
 ::-webkit-scrollbar-thumb{background:#2A2A2A;border-radius:2px;}
@@ -3177,7 +3201,11 @@ function printCert() {
     ${document.querySelector('style').innerHTML}
   </style></head><body>
   <div style="max-width:560px;margin:0 auto;">${cert.outerHTML}</div>
-  <script>window.onload=()=>window.print()<\/script>
+  <script>window.onload=()=>window.print()<\/script></body></html>`);
+  w.document.close();
+}
+</script>
+
 <!-- ═══════════════════════════════════════════════════
   ADMIN PORTAL — shown only after admin login
 ═══════════════════════════════════════════════════ -->
@@ -3433,10 +3461,8 @@ function printCert() {
   </div>
 </div>
 </div>
-</body></html>`);
-  w.document.close();
-}
 
+<script>
 // ══════════════════════════════════════════
 // WORD HIGHLIGHT ENGINE
 // ══════════════════════════════════════════
@@ -3814,7 +3840,7 @@ function showAdminPortal() {
   document.querySelectorAll('.screen').forEach(s => { s.style.display = 'none'; });
   // Show admin portal (position:fixed so it covers everything)
   const portal = document.getElementById('admin-portal');
-  portal.style.display = 'block';
+  portal.style.display = 'flex';
   // Render admin content
   try { refreshAll(); } catch(e) { console.error('Admin render error:', e); }
 }
