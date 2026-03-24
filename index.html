@@ -2340,35 +2340,60 @@ const missions = [
     quiz: [
       {
         q: 'What is MSS used for?',
-        opts: ['It\'s the mobile app merchants use to sell', 'It\'s an internal back-end tool used by staff to manage and support merchants', 'It\'s the web portal for online store setup', 'It\'s the Freshdesk support ticketing system'],
+        opts: [
+          'The merchant-facing mobile app where they manage their store and view sales',
+          'An internal back-end tool used by staff to look up and support merchants',
+          'The web portal where merchants set up their online store and products',
+          'The customer ticketing system used to log and track support escalations'
+        ],
         correct: 1,
         hint: 'MSS is something merchants never see — only your support team uses it behind the scenes to look up and manage merchant accounts.',
         explain: 'MSS (Merchant Success Studio) is an internal tool used by support staff — merchants never access it directly.'
       },
       {
         q: 'A merchant says they never receive their password reset emails. What is the FIRST thing to check in MSS?',
-        opts: ['Their sales report', 'Their email address on the MSS profile and confirm they are fully registered (not guest mode)', 'Their linked devices', 'Their terminal ID'],
+        opts: [
+          'Their monthly sales report and most recent transaction history',
+          'Their MSS profile email address and confirm they are fully registered, not in guest mode',
+          'Their linked POS devices and the terminal IDs assigned to their account',
+          'Their subscription plan and whether their billing is up to date'
+        ],
         correct: 1,
         hint: 'Two things to check: is the email address actually correct on their profile, and are they a fully registered user or still in guest mode?',
         explain: 'Check in MSS that the email address is correct and that the merchant is fully registered. Guest mode users cannot receive password reset emails.'
       },
       {
         q: 'You are linking a merchant\'s Online Payment Gateway MID in MSS. You type "ABC123DEF". What is wrong?',
-        opts: ['The MID should have numbers only', 'Online Payment Gateway MIDs are case sensitive and must be lowercase: "abc123def"', 'MIDs must be exactly 8 characters', 'Nothing is wrong'],
+        opts: [
+          'The MID should contain only numbers — letters are not accepted in this field',
+          'The MID is case sensitive and must be entered in lowercase letters: "abc123def"',
+          'MIDs must be exactly 8 characters — this one is too long at 9 characters',
+          'Nothing is wrong — the system accepts any combination of letters and numbers'
+        ],
         correct: 1,
         hint: 'The Online Payment Gateway MID is very picky about one thing — uppercase vs lowercase letters matter here.',
-        explain: 'The Online Payment Gateway MID is case sensitive and must always be entered in lowercase. Uppercase letters will cause a mismatch.'
+        explain: 'The Online Payment Gateway MID is case sensitive and must always be entered in lowercase. Uppercase letters will cause a mismatch and payments won\'t work.'
       },
       {
         q: 'A merchant\'s online store card form is not loading. After checking MSS, you find the eCom MID is NOT linked. What do you do?',
-        opts: ['Tell the merchant to recreate their online store', 'Log a Freshdesk ticket immediately', 'Link the eCom Transactional MID in MSS under Linked Accounts, enable Online Payments, and save', 'Ask the merchant to wait 24 hours'],
+        opts: [
+          'Ask the merchant to delete and recreate their online store from scratch in the web portal',
+          'Log a Freshdesk ticket straight away and advise the merchant to wait for a callback',
+          'Go to Linked Accounts in MSS, add the Online Payment Gateway, enter the MID in lowercase, enable and save',
+          'Advise the merchant to contact their bank directly to re-enable their online payment facility'
+        ],
         correct: 2,
         hint: 'You can fix this directly in MSS — go to Linked Accounts, add the payment gateway provider, enter the MID in lowercase, enable and save.',
         explain: 'In MSS, go to Linked Accounts, add the Online Payment Gateway, enter the Transactional MID (lowercase), enable and save. Then test if payments work.'
       },
       {
         q: 'Before escalating an issue to Freshdesk, what should you always do first?',
-        opts: ['Call the merchant back immediately', 'Check MSS to see if the issue can be resolved directly — many issues can be fixed without escalation', 'Send an email to the bank', 'Ask the merchant to reinstall the app'],
+        opts: [
+          'Call the merchant back to confirm the full details of the issue before taking any action',
+          'Check MSS to see if the issue can be resolved directly without needing to escalate',
+          'Send an internal email to the bank\'s technical team to flag the issue for review',
+          'Ask the merchant to uninstall and reinstall the app, then test again before logging a ticket'
+        ],
         correct: 1,
         hint: 'Freshdesk is for escalation only. Your first stop should always be the internal tool where you can look up and fix most merchant issues directly.',
         explain: 'Always check MSS first. Many merchant issues (MID mismatches, registration checks, password resets, eCom linking) can be resolved directly in MSS without needing a Freshdesk ticket.'
@@ -3301,7 +3326,10 @@ function selectAnswer(idx) {
   document.getElementById('q-feedback-title').textContent = isCorrect ? '✓ Correct!' : '✗ Not quite';
   document.getElementById('q-feedback-text').textContent = q.explain;
 
-  document.getElementById('btn-next').className = 'btn-next ready';
+  const btnNext = document.getElementById('btn-next');
+  btnNext.className = 'btn-next ready';
+  // Scroll the button into view on mobile so users can see it after feedback appears
+  setTimeout(() => { try { btnNext.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); } catch(e) {} }, 150);
 
   // ARIA reaction
   ariaReact(isCorrect);
@@ -3321,8 +3349,16 @@ function nextQuestion() {
   if (currentQuiz < m.quiz.length - 1) {
     currentQuiz++;
     renderQuestion();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   } else {
-    showResults();
+    try {
+      showResults();
+    } catch(e) {
+      console.error('[LMS] showResults error:', e);
+      // Safety net: save what we have and show results screen anyway
+      try { saveAttempt(currentMission, quizScore, quizScore >= Math.ceil(missions[currentMission].quiz.length * 0.6), [...quizAnswers]); } catch(e2) {}
+      showScreen('results-screen');
+    }
   }
 }
 
