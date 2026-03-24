@@ -2746,8 +2746,37 @@ if (FB_LIVE) {
   try {
     if (!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
     fbDb = firebase.database();
-    console.log('[LMS] Firebase connected — cross-device sync active');
+    console.log('[LMS] Firebase SDK initialised — testing write access…');
+    // ── Connection test: write a tiny probe value ──────────────────────────
+    fbDb.ref('.info/connected').on('value', snap => {
+      window._fbConnected = snap.val() === true;
+      console.log('[LMS] Firebase realtime connection:', window._fbConnected ? 'ONLINE' : 'OFFLINE');
+      _updateFbStatusBadge();
+    });
+    fbDb.ref('_lms_probe').set({ ts: Date.now() })
+      .then(() => {
+        console.log('[LMS] ✅ Firebase write OK — sync is active');
+        window._fbWriteOk = true;
+        _updateFbStatusBadge();
+      })
+      .catch(err => {
+        console.error('[LMS] ❌ Firebase write BLOCKED:', err.message);
+        console.error('[LMS] ➜ Fix: go to Firebase Console → Realtime Database → Rules and set read/write to true');
+        window._fbWriteOk = false;
+        window._fbWriteError = err.message;
+        _updateFbStatusBadge();
+      });
   } catch(e) { console.warn('[LMS] Firebase init error:', e); }
+}
+
+function _updateFbStatusBadge() {
+  const badge = document.getElementById('fb-status-badge');
+  if (!badge) return;
+  if (!fbDb)                          { badge.textContent = '⚠ Firebase not configured'; badge.style.background = '#555'; return; }
+  if (window._fbWriteOk === false)    { badge.textContent = '🔴 Firebase rules blocking writes — see console'; badge.style.background = '#8B0000'; return; }
+  if (window._fbWriteOk === true)     { badge.textContent = '🟢 Firebase syncing'; badge.style.background = '#1A5C2A'; return; }
+  if (window._fbConnected === false)  { badge.textContent = '🟡 Firebase offline'; badge.style.background = '#7A5C00'; return; }
+  badge.textContent = '⏳ Firebase connecting…'; badge.style.background = '#333';
 }
 
 // Safe key for Firebase paths (replace disallowed chars)
@@ -2759,7 +2788,14 @@ function fbKey(username) { return btoa(username.toLowerCase()).replace(/[.#$/\[\
 // Push one user record to Firebase (fire-and-forget, never blocks)
 function fbPushUser(user) {
   if (!fbDb) return;
-  try { fbDb.ref('lms_users/' + fbKey(user.username)).set(Object.assign({}, user)); } catch(e) {}
+  fbDb.ref('lms_users/' + fbKey(user.username)).set(Object.assign({}, user))
+    .then(() => { window._fbWriteOk = true; _updateFbStatusBadge(); })
+    .catch(err => {
+      window._fbWriteOk = false;
+      window._fbWriteError = err.message;
+      console.error('[LMS] User sync failed — Firebase rules may be blocking writes:', err.message);
+      _updateFbStatusBadge();
+    });
 }
 
 // Fetch a single user from Firebase (one-time read) and cache in localStorage
@@ -3438,6 +3474,7 @@ function printCert() {
       <div class="tb-breadcrumb" id="tb-crumb">Mission Control Admin</div>
     </div>
     <div class="tb-live-badge"><div class="tb-live-dot"></div>Live</div>
+    <div id="fb-status-badge" style="font-size:11px;padding:3px 10px;border-radius:20px;background:#333;color:#fff;cursor:default;white-space:nowrap">⏳ Firebase connecting…</div>
     <div class="tb-updated" id="tb-updated">—</div>
     <button class="btn-refresh" id="btn-refresh" onclick="manualRefresh()">↺ Refresh</button>
   </div>
@@ -3697,7 +3734,15 @@ function setSessions(sessions) {
   if (fbDb && window._sessionId) {
     const cur = sessions.find(s => s._sid === window._sessionId);
     if (cur) {
-      fbDb.ref('lms_sessions/' + window._sessionId).set(cur).catch(() => {});
+      fbDb.ref('lms_sessions/' + window._sessionId).set(cur)
+        .then(() => { window._fbWriteOk = true; })
+        .catch(err => {
+          window._fbWriteOk = false;
+          window._fbWriteError = err.message;
+          console.error('[LMS] Session sync failed:', err.message,
+            '\n➜ Fix Firebase rules: console.firebase.google.com → project littlefish-lmsshopred → Realtime Database → Rules → set .read and .write to true');
+          _updateFbStatusBadge();
+        });
     }
   }
 }
@@ -4130,6 +4175,7 @@ function showAdminPortal() {
   document.querySelectorAll('.screen').forEach(s => { s.style.display = 'none'; });
   const portal = document.getElementById('admin-portal');
   portal.style.display = 'flex';
+  _updateFbStatusBadge(); // show current Firebase status immediately
 
   if (fbDb) {
     // ── 1. Real-time listener on lms_sessions ──────────────────────────────
